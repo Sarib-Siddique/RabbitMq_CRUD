@@ -12,6 +12,8 @@ const queues = [
   "user.delete",
 ];
 
+const DLQ = "dead.letter.queue";
+
 async function connectWithRetry(uri, retries = 10, delay = 5000) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -34,20 +36,32 @@ const channel = await connection.createChannel();
 console.log("Consumer connected to RabbitMQ");
 
 for (const q of queues) {
-  await channel.assertQueue(q, { durable: false });
+  // Main queue with DLX (should match publisher)
+  await channel.assertQueue(q, {
+    durable: false,
+    arguments: {
+      "x-dead-letter-exchange": "dlx.exchange",
+      "x-dead-letter-routing-key": "dead",
+    },
+  });
 
   channel.consume(q, async (msg) => {
     const content = JSON.parse(msg.content.toString());
-    console.log(`⬅ Received ${q}:`, content);
+    console.log(`Received ${q}:`, content);
 
     try {
+      // Force error for DLQ test
+      if (content.forceError) {
+        throw new Error("Forced error for DLQ test");
+      }
+
       if (q === "user.create") {
         await User.create(content);
         console.log("User created");
       } else if (q === "user.read.all") {
         const users = await User.findAll();
         console.log(
-          "👥 All users:",
+          "All users:",
           users.map((u) => u.toJSON())
         );
         // Optionally, send users to another queue
@@ -73,10 +87,30 @@ for (const q of queues) {
         }
       }
 
+      // Send a generic response for read.all and read.one (no RPC, just confirmation)
+      if (
+        (q === "user.read.all" || q === "user.read.one") &&
+        msg.properties.replyTo &&
+        msg.properties.correlationId
+      ) {
+        await channel.sendToQueue(
+          msg.properties.replyTo,
+          Buffer.from(JSON.stringify({ status: `Message sent to ${q} queue` })),
+          { correlationId: msg.properties.correlationId }
+        );
+      }
+
       channel.ack(msg);
     } catch (err) {
-      console.error("Error:", err.message);
-      channel.nack(msg);
+      console.error("Error processing message, sending to DLQ", err);
+      channel.nack(msg, false, false); // Send to DLX
     }
   });
 }
+
+// Optionally, consume from DLQ for logging
+await channel.assertQueue(DLQ, { durable: true });
+channel.consume(DLQ, (msg) => {
+  console.error("Dead lettered message:", msg.content.toString());
+  channel.ack(msg);
+});
